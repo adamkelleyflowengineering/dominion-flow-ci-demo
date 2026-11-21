@@ -9,7 +9,7 @@ RANGES_KM = [25, 50, 100, 150, 200]
 DEPTHS = [4, 8, 16]
 
 PLANNED = [LinkConfig(f"LOS {r} km / interleaver {d}", r, d) for r in RANGES_KM for d in DEPTHS]
-PLANNED += [LinkConfig(f"Relay {r} km / interleaver 4", r, 4, relay=True) for r in (150, 200, 300, 400, 500)]
+PLANNED += [LinkConfig(f"Relay {r} km / interleaver 8", r, 8, relay=True) for r in (150, 200, 300, 400, 500)]
 # Intentionally failing planned configuration for the demo: the Inuvik relay
 # corridor was planned with interleaver depth 8, which pushes the RF segment to
 # ~146 ms and the end-to-end budget to ~260 ms.
