@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
-"""Post CI results to Flow (webhook source "ci-test-results").
+"""Send CI results to Flow and keep Linear (standing in for Jira) in sync.
 
-Reads JUnit XML (pytest --junitxml), coverage.xml and bandit JSON, groups test
-outcomes by the Flow test case tagged on each test, and sends one webhook to
-Flow's automation trigger endpoint. The Flow automation "Ingest CI test
-results" then creates a Pass/Fail Test Result under each test case and writes
-requirement actual values (coverage %, high-severity findings).
+What happens on every GitHub Actions run:
+
+1. Read JUnit XML (pytest), coverage.xml and bandit JSON and group the results by the
+   Flow test case each test is tagged with (see conftest.py).
+2. Linear: fire the Flow automation "CI failure → Linear ticket" (webhook ci-linear-sync).
+   A failing test case opens (or updates) "CI failure: REQ-… <requirement>" in the Flow Demo
+   team; a passing one marks that ticket fixed.
+3. Flow:
+   * Pull request -> a Flow branch named "GitHub PR #<n> – <PR title>" is created (or reused)
+     and a Test Result per test case plus requirement Actual Values are written on it, so the
+     branch's Review tab shows exactly what this PR changed.
+   * Push to main / manual run -> the Flow automation "Ingest CI test results" (webhook
+     ci-test-results) records the results on its review branch.
 
 Env: FLOW_API_KEY (secret), FLOW_CUSTOMER (e.g. "demo"), optional FLOW_API_BASE,
-GITHUB_* variables provided by GitHub Actions.
+PR_NUMBER / PR_TITLE / PR_URL (set by the workflow on pull_request events),
+optional LINEAR_API_KEY (lets CI also move fixed tickets to Done, comment and set the project),
+and the GITHUB_* variables provided by GitHub Actions.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import json
 import os
@@ -24,25 +35,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 IDS = json.loads((ROOT / "flow_ids.json").read_text())
+PROJECT = IDS["project_id"]
+APP_URL = IDS["project_url"]
+API = os.environ.get("FLOW_API_BASE", "https://backend.branch.flowengineering.com")
 
 COVERAGE_TC, COVERAGE_REQ, COVERAGE_MIN = "TES-44178", "REQ-44094", 80.0
 STATIC_TC, STATIC_REQ = "TES-44181", "REQ-44095"
 PUBLISH_TC, PUBLISH_REQ = "TES-44184", "REQ-44096"
 SWEEP_TC, LATMODEL_REQ = "TES-44190", "REQ-44098"
+MAIN_REVIEW_BRANCH = "Automation: Ingest CI test results"
+
+# Flow field keys (Test Result / Requirement)
+RESULT, MEASURED, TEST_DATE = "D5myzo6EgUPreacLcZew3", "measured", "testDate"
+BASELINE, BUILD, RUN_LINK, LINEAR = "softwareBaseline", "buildLot", "ciRunUrl", "linear_issue"
+ACTUAL, UPPER, LOWER = "SZEURRJ3MXuRBeiw1jNnI", "value", "CasMf8leEE2hiAtnFnSLc"
 
 
+# ----------------------------------------------------------------------------- results
 def parse_junit(path: Path) -> dict:
-    groups: dict = defaultdict(lambda: {"passed": 0, "failed": 0, "failures": [], "measured": []})
+    groups: dict = defaultdict(lambda: {"passed": 0, "failed": 0, "failures": [], "measured": [], "requirements": []})
     for case in ET.parse(path).getroot().iter("testcase"):
         props = {p.get("name"): p.get("value") for p in case.iter("property")}
         tc = props.get("flow_test_case")
-        if not tc:
+        if not tc or case.find("skipped") is not None:
             continue
         g = groups[tc]
-        failed = case.find("failure") is not None or case.find("error") is not None
-        if case.find("skipped") is not None:
-            continue
-        if failed:
+        if not g["requirements"] and props.get("flow_requirements"):
+            g["requirements"] = props["flow_requirements"].split(",")
+        if case.find("failure") is not None or case.find("error") is not None:
             g["failed"] += 1
             g["failures"].append(case.get("name"))
         else:
@@ -52,9 +72,9 @@ def parse_junit(path: Path) -> dict:
     return groups
 
 
-def tc_entry(ref: str, outcome: str, measured=None, passed=0, failed=0, failures=None) -> dict:
-    return {"id": IDS["test_cases"][ref]["id"], "ref": ref, "outcome": outcome,
-            "measured": measured, "passed": passed, "failed": failed, "failures": failures or []}
+def tc_entry(ref, outcome, measured=None, passed=0, failed=0, failures=None, requirements=None) -> dict:
+    return {"id": IDS["test_cases"][ref]["id"], "ref": ref, "outcome": outcome, "measured": measured,
+            "passed": passed, "failed": failed, "failures": failures or [], "requirements": requirements or []}
 
 
 def req_entry(ref: str, value) -> dict:
@@ -67,47 +87,196 @@ def build_payload(junit: Path, coverage: Path | None, bandit: Path | None, start
         if ref not in IDS["test_cases"]:
             continue
         measured = max(g["measured"]) if g["measured"] else None
-        test_cases.append(tc_entry(ref, "fail" if g["failed"] else "pass", measured,
-                                   g["passed"], g["failed"], g["failures"]))
+        test_cases.append(tc_entry(ref, "fail" if g["failed"] else "pass", measured, g["passed"], g["failed"],
+                                   g["failures"], g["requirements"]))
         if ref == SWEEP_TC and measured is not None:
             req_values.append(req_entry(LATMODEL_REQ, measured))  # worst planned-config budget, ms
     if coverage and coverage.exists():
         pct = round(float(ET.parse(coverage).getroot().get("line-rate")) * 100, 1)
-        test_cases.append(tc_entry(COVERAGE_TC, "pass" if pct >= COVERAGE_MIN else "fail", pct))
+        test_cases.append(tc_entry(COVERAGE_TC, "pass" if pct >= COVERAGE_MIN else "fail", pct,
+                                   requirements=[COVERAGE_REQ], failures=[] if pct >= COVERAGE_MIN else [f"coverage {pct}% < 80%"]))
         req_values.append(req_entry(COVERAGE_REQ, pct))
     if bandit and bandit.exists():
         results = json.loads(bandit.read_text()).get("results", [])
         high = sum(1 for r in results if r.get("issue_severity") == "HIGH")
-        test_cases.append(tc_entry(STATIC_TC, "pass" if high == 0 else "fail", high))
+        test_cases.append(tc_entry(STATIC_TC, "pass" if high == 0 else "fail", high, requirements=[STATIC_REQ],
+                                   failures=[f"{high} high-severity bandit findings"] if high else []))
         req_values.append(req_entry(STATIC_REQ, high))
     if started:
-        minutes = round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds() / 60, 1)
-        test_cases.append(tc_entry(PUBLISH_TC, "pass" if minutes <= 30 else "fail", minutes))
+        start = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
+        minutes = round((dt.datetime.now(dt.timezone.utc) - start).total_seconds() / 60, 1)
+        test_cases.append(tc_entry(PUBLISH_TC, "pass" if minutes <= 30 else "fail", minutes, requirements=[PUBLISH_REQ]))
         req_values.append(req_entry(PUBLISH_REQ, minutes))
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repo = os.environ.get("GITHUB_REPOSITORY", "adamkelleyflowengineering/dominion-flow-ci-demo")
     run_id = os.environ.get("GITHUB_RUN_ID")
+    pr = os.environ.get("PR_NUMBER") or None
     return {
-        "commit": os.environ.get("GITHUB_SHA", "local"),
-        "branch": os.environ.get("GITHUB_REF_NAME", "local"),
+        "commit": os.environ.get("PR_HEAD_SHA") or os.environ.get("GITHUB_SHA", "local"),
+        "branch": os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "local"),
         "run_number": os.environ.get("GITHUB_RUN_NUMBER", "local"),
         "run_url": f"{server}/{repo}/actions/runs/{run_id}" if run_id else "local run",
-        "date": dt.date.today().isoformat(),
+        "date": dt.datetime.now(dt.timezone.utc).date().isoformat(),
+        "pr": {"number": int(pr), "title": os.environ.get("PR_TITLE", ""), "url": os.environ.get("PR_URL", "")} if pr else None,
         "test_cases": test_cases,
         "requirement_values": req_values,
     }
 
 
-def post(payload: dict) -> dict:
-    base = os.environ.get("FLOW_API_BASE", "https://backend.branch.flowengineering.com")
-    body = json.dumps({"project_id": IDS["project_id"], "source": "ci-test-results",
-                       "context": payload, "wait": True}).encode()
-    request = urllib.request.Request(base + "/ai/trigger", data=body, method="POST", headers={
-        "X-API-Key": os.environ["FLOW_API_KEY"],
-        "customer": os.environ.get("FLOW_CUSTOMER", "demo"),
+# ----------------------------------------------------------------------------- Flow API
+def flow(method: str, path: str, body=None, timeout=120):
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(API + path, data=data, method=method, headers={
+        "X-API-Key": os.environ["FLOW_API_KEY"], "customer": os.environ.get("FLOW_CUSTOMER", "demo"),
         "Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=300) as resp:  # nosec B310 - fixed https endpoint
-        return json.loads(resp.read() or b"{}")
+    with urllib.request.urlopen(request, timeout=timeout) as resp:  # nosec B310 - fixed https endpoint
+        raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+
+def trigger(source: str, context: dict) -> list:
+    return flow("POST", "/ai/trigger", {"project_id": PROJECT, "source": source, "context": context, "wait": True},
+                timeout=300).get("results", [])
+
+
+def list_branches() -> list:
+    res = flow("GET", f"/project/{PROJECT}/branch")
+    return res if isinstance(res, list) else res.get("items", res.get("branches", []))
+
+
+def ensure_pr_branch(pr: dict) -> tuple[str, str]:
+    prefix = f"GitHub PR #{pr['number']} "
+    for b in list_branches():
+        if isinstance(b, dict) and str(b.get("name", "")).startswith(prefix):
+            return b["id"], b["name"]
+    name = (prefix + "– " + (pr["title"] or "")).strip()[:100]
+    created = flow("POST", f"/project/{PROJECT}/branch", {
+        "name": name, "parent_id": "master",
+        "description": f"CI results from GitHub pull request #{pr['number']}: {pr['url']}\n"
+                       "Created automatically by the dominion-flow-ci-demo workflow."})
+    return created["id"], name
+
+
+def branch_id_by_name(name: str) -> str:
+    for b in list_branches():
+        if isinstance(b, dict) and b.get("name") == name:
+            return b["id"]
+    return "master"
+
+
+def item_link(branch_id: str, entity_id: str) -> str:
+    return f"{APP_URL}/{branch_id}/table?focusedId={entity_id}&detailsId={entity_id}"
+
+
+def get_entity(entity_id: str, branch_id: str) -> dict:
+    e = flow("GET", f"/project/{PROJECT}/entities/{entity_id}?branch_id={branch_id}")
+    return e[0] if isinstance(e, list) else e
+
+
+def num(v):
+    return v.get("value") if isinstance(v, dict) else v
+
+
+# ----------------------------------------------------------------------------- Linear (via Flow)
+def linear_sync(payload: dict, label: str, branch_id: str) -> dict:
+    users = {u["id"]: u.get("email") for u in flow("GET", "/users")}
+    failing, passing = [], []
+    for tc in payload["test_cases"]:
+        reqs = [r for r in tc.get("requirements", []) if r in IDS["requirements"]]
+        if not reqs:
+            continue
+        req = get_entity(IDS["requirements"][reqs[0]]["id"], branch_id)
+        tce = get_entity(tc["id"], branch_id)
+        title = f"CI failure: {reqs[0]} {req['values'].get('name')} ({tc['ref']})"
+        item = {"key": tc["ref"], "title": title, "req_ref": reqs[0], "req_name": req["values"].get("name"),
+                "tc_ref": tc["ref"], "tc_name": tce["values"].get("name"), "measured": tc["measured"],
+                "flow_link": item_link(branch_id, req["id"])}
+        if tc["outcome"] == "fail":
+            lim = num(req["values"].get(UPPER))
+            lo = num(req["values"].get(LOWER))
+            item["limit"] = f"≤ {lim}" if lim is not None else (f"≥ {lo}" if lo is not None else "see requirement")
+            item["failures"] = tc["failures"]
+            owners = [tce["values"].get("owner"), req["values"].get("owner")]
+            item["assignees"] = [users[o] for o in owners if o in users] + ["alex@flowengineering.com"]
+            failing.append(item)
+        else:
+            passing.append(item)
+    if not failing and not passing:
+        return {}
+    pr = payload.get("pr") or {}
+    results = trigger("ci-linear-sync", {"label": label, "run_url": payload["run_url"], "commit": payload["commit"],
+                                         "pr_url": pr.get("url", ""), "failing": failing, "passing": passing})
+    for r in results:
+        text = r.get("integration_response") or ""
+        if "RESULT=" in text:
+            return ast.literal_eval(text.split("RESULT=", 1)[1].split("\n", 1)[0].strip())
+    return {}
+
+
+def linear_extras(tickets: dict, label: str, payload: dict) -> None:
+    """Optional: with LINEAR_API_KEY, put new tickets in the demo project and move fixed ones to Done."""
+    key = os.environ.get("LINEAR_API_KEY")
+    if not key or not tickets:
+        return
+
+    def gql(query, variables):
+        request = urllib.request.Request("https://api.linear.app/graphql", method="POST",
+                                         data=json.dumps({"query": query, "variables": variables}).encode(),
+                                         headers={"Authorization": key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=30) as resp:  # nosec B310 - fixed https endpoint
+            return json.loads(resp.read())
+
+    team = gql('query{team(id:"b346900b-099e-44ea-813b-05ef890a8bad"){states{nodes{id name}}}}', {})
+    done = next(s["id"] for s in team["data"]["team"]["states"]["nodes"] if s["name"] == "Done")
+    for t in tickets.values():
+        issue = gql("query($id:String!){issue(id:$id){id}}", {"id": t["identifier"]})["data"]["issue"]["id"]
+        if t["action"] == "created":
+            gql("mutation($id:String!,$p:String!){issueUpdate(id:$id,input:{projectId:$p}){success}}",
+                {"id": issue, "p": "1993b337-4e6d-43b9-8f24-f52bbf2011e6"})
+        if t["action"] == "resolved":
+            gql("mutation($id:String!,$s:String!){issueUpdate(id:$id,input:{stateId:$s}){success}}", {"id": issue, "s": done})
+            gql("mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}",
+                {"id": issue, "b": f"CI is green on {label}: {payload['run_url']}. Moved to Done by GitHub Actions."})
+
+
+# ----------------------------------------------------------------------------- writes
+def write_pr_branch(branch_id: str, payload: dict, tickets: dict) -> int:
+    sha = str(payload["commit"])[:7]
+    pr = payload["pr"]
+    tcs = [t for t in payload["test_cases"]]
+    created = flow("POST", f"/project/{PROJECT}/entities/batch", {"branchId": branch_id, "entities": [
+        {"entityType": "testRun", "name": f"{get_entity(t['id'], branch_id)['values'].get('name')} – PR #{pr['number']} @ {sha}"}
+        for t in tcs]})
+    flow("POST", f"/project/{PROJECT}/entities/links/batch", {"branchId": branch_id, "links": [
+        {"sourceId": t["id"], "destinationId": c["id"]} for t, c in zip(tcs, created)]})
+    updates = []
+    for t, c in zip(tcs, created):
+        paras = [f"Automated CI result from GitHub Actions: {t['passed']} passed, {t['failed']} failed.",
+                 f"Pull request #{pr['number']}: {pr['title']} – {pr['url']}",
+                 f"Workflow run: {payload['run_url']}", f"Commit: {payload['commit']} on {payload['branch']}"]
+        if t["failures"]:
+            paras.append("Failing tests: " + "; ".join(t["failures"][:20]))
+        vals = {RESULT: "Pass" if t["outcome"] == "pass" else "Fail", TEST_DATE: payload["date"],
+                BASELINE: f"dominion-flow-ci-demo@{sha}", BUILD: f"GitHub Actions run {payload['run_number']} (PR #{pr['number']})",
+                RUN_LINK: payload["run_url"],
+                "description": [{"type": "p", "children": [{"text": p}]} for p in paras]}
+        if t["measured"] is not None:
+            vals[MEASURED] = t["measured"]
+        if t["ref"] in tickets:
+            vals[LINEAR] = [tickets[t["ref"]]["url"]]
+        updates += [{"entityId": c["id"], "key": k, "value": v} for k, v in vals.items()]
+    updates += [{"entityId": r["id"], "key": ACTUAL, "value": r["value"]} for r in payload["requirement_values"]]
+    flow("PUT", f"/project/{PROJECT}/entities/values/batch", {"branchId": branch_id, "updates": updates})
+    return len(created)
+
+
+def summary(lines: list) -> None:
+    text = "\n".join(lines)
+    print(text)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a") as fh:
+            fh.write(text + "\n")
 
 
 def main() -> int:
@@ -116,14 +285,40 @@ def main() -> int:
     ap.add_argument("--coverage", default="reports/coverage.xml", type=Path)
     ap.add_argument("--bandit", default="reports/bandit.json", type=Path)
     ap.add_argument("--started", default=os.environ.get("WORKFLOW_STARTED_AT"))
+    ap.add_argument("--no-linear", action="store_true", help="skip the Linear sync")
     ap.add_argument("--dry-run", action="store_true", help="print the payload, do not post")
     args = ap.parse_args()
     payload = build_payload(args.junit, args.coverage, args.bandit, args.started)
-    print(json.dumps(payload, indent=2))
     if args.dry_run:
+        print(json.dumps(payload, indent=2))
         return 0
-    result = post(payload)
-    print(json.dumps(result, indent=2)[:4000])
+    pr = payload["pr"]
+    if pr:
+        branch_id, branch_name = ensure_pr_branch(pr)
+        label = f"PR #{pr['number']}"
+    else:
+        branch_name = MAIN_REVIEW_BRANCH
+        branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
+        label = str(payload["branch"])
+    tickets = {} if args.no_linear else linear_sync(payload, label, branch_id)
+    linear_extras(tickets, label, payload)
+    if pr:
+        n = write_pr_branch(branch_id, payload, tickets)
+        how = f"wrote {n} test results + {len(payload['requirement_values'])} requirement values directly"
+    else:
+        for t in payload["test_cases"]:
+            if t["ref"] in tickets:
+                t["linear_issue"] = tickets[t["ref"]]["url"]
+        res = trigger("ci-test-results", payload)
+        how = (res[0].get("integration_response") or "").strip().splitlines()[-2:] if res else "no automation matched"
+        branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
+    lines = ["## Flow", f"- Flow branch: **{branch_name}** – {APP_URL}/{branch_id}/table", f"- {how}", "", "## Test cases"]
+    lines += [f"- {'✅' if t['outcome'] == 'pass' else '❌'} {t['ref']} {t['outcome'].upper()}"
+              + (f" (measured {t['measured']})" if t["measured"] is not None else "") for t in payload["test_cases"]]
+    if tickets:
+        lines += ["", "## Linear (stands in for Jira)"]
+        lines += [f"- {k}: {v['identifier']} {v['action']} – {v['url']}" for k, v in tickets.items()]
+    summary(lines)
     return 0
 
 

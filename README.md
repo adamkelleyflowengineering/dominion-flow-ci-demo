@@ -34,20 +34,30 @@ def test_planned_configuration_within_budget(config, flow_measure): ...
 
 `conftest.py` writes those IDs (and any measured value) into the JUnit XML as test properties.
 
-## How results reach Flow
+## How results reach Flow (and Linear)
 
-1. The workflow runs on every push / PR to `main` (or manually via *Run workflow*).
-2. `scripts/post_to_flow.py` sends one webhook: `POST https://backend.branch.flowengineering.com/ai/trigger`
-   with `source: "ci-test-results"` and the grouped results as `context`.
-3. The Flow automation **Ingest CI test results** (project Settings → Automations) creates a
-   **Test Result** (Pass/Fail, measured value, commit SHA, run link, failing test names) under each
-   test case and writes requirement **Actual Values** (coverage %, high-severity findings, worst-case
-   latency budget). Requirement verification status then rolls up in Flow automatically.
+1. The workflow runs on every pull request, every push to `main`, and on demand (*Run workflow*).
+2. `scripts/post_to_flow.py` groups the JUnit results by Flow test case, then:
+   * **Linear (standing in for Jira):** fires the Flow automation **CI failure → Linear ticket**
+     (`source: "ci-linear-sync"`). A failing test case opens, or updates, a ticket in the Flow Demo team
+     titled `CI failure: REQ-… <requirement> (TES-…)`, assigned to the owner, with the failing test names,
+     the GitHub run link and the Flow link. When that test case passes later, the ticket is renamed
+     `✅ Fixed in PR #n – …` and the passing evidence is appended. (With an optional `LINEAR_API_KEY`
+     secret, CI also moves it to **Done**, comments, and files new tickets in the
+     *Dominion demo – test execution loop* project.)
+   * **Pull request →** a Flow branch named **`GitHub PR #<n> – <PR title>`** is created (or reused on
+     later pushes). A Test Result per test case (Pass/Fail, measured value, commit, run link, Linear ticket)
+     and the requirement Actual Values are written on it, so the branch's **Review** tab shows exactly what
+     the PR changed, and requirement Verification flips red/green on that branch.
+   * **Push to `main` →** the Flow automation **Ingest CI test results** (`source: "ci-test-results"`)
+     records the results on its review branch *Automation: Ingest CI test results*.
+3. The job summary on GitHub lists the Flow branch, every test case result and the Linear tickets.
 
-The intentionally failing case — *Inuvik relay corridor 300 km / interleaver 8* (≈ 147 ms RF, ≈ 261 ms
-end to end) — makes TES-44190 **Fail** and pushes REQ-44098's actual value over its 250 ms limit,
-so the workshop can show a requirement being flagged by a code change. Change the interleaver to 4
-in `tests/test_latency_sweep.py`, push, and watch it go green in Flow.
+The intentionally failing case on `main` — *Inuvik relay corridor 300 km / interleaver 8* (≈ 147 ms RF,
+≈ 261 ms end to end) — makes TES-44190 **Fail**, pushes REQ-44098's actual value over its 250 ms limit and
+opens a Linear ticket. The branch `demo/inuvik-interleaver-fix` changes that one line to interleaver 4:
+open a PR from it and Flow creates a `GitHub PR #n` branch where REQ-44098 turns **Pass** and the ticket is
+marked fixed.
 
 ## Setup
 
@@ -57,6 +67,7 @@ Repository secrets (Settings → Secrets and variables → Actions):
 | -- | -- |
 | `FLOW_API_KEY` | Flow API key with access to the demo project |
 | `FLOW_CUSTOMER` | `demo` |
+| `LINEAR_API_KEY` (optional) | Linear personal API key: lets CI move fixed tickets to Done, comment, and set the project |
 
 Run locally:
 
