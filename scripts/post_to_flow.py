@@ -310,7 +310,9 @@ def main() -> int:
             if t["ref"] in tickets:
                 t["linear_issue"] = tickets[t["ref"]]["url"]
         res = trigger("ci-test-results", payload)
-        how = (res[0].get("integration_response") or "").strip().splitlines()[-2:] if res else "no automation matched"
+        out = (res[0].get("integration_response") or "") if res else ""
+        how = "; ".join(ln.strip() for ln in out.splitlines() if ln.startswith(("Test results created", "Requirement values")))
+        how = how or "Flow automation 'Ingest CI test results' did not report results"
         branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
     lines = ["## Flow", f"- Flow branch: **{branch_name}** – {APP_URL}/{branch_id}/table", f"- {how}", "", "## Test cases"]
     lines += [f"- {'✅' if t['outcome'] == 'pass' else '❌'} {t['ref']} {t['outcome'].upper()}"
