@@ -39,7 +39,8 @@ def verify() -> int:
     ref = "REQ-44098"
     v = p.get_entity(p.IDS["requirements"][ref]["id"], branch)["values"]
     status, actual, upper = v.get("verification"), p.num(v.get(p.ACTUAL)), p.num(v.get(p.UPPER))
-    summary(f"- Flow ({p.MAIN_REVIEW_BRANCH}): {ref} {v.get('name')} is **{status}**, {actual} ms vs ≤ {upper} ms")
+    summary(f"- Flow starting branch **{p.MAIN_REVIEW_BRANCH}** ({p.APP_URL}/{branch}/table): "
+            f"{ref} {v.get('name')} is **{status}**, {actual} ms vs ≤ {upper} ms")
     return 0 if status == "Fail" else 1
 
 
