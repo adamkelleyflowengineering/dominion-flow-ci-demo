@@ -3,7 +3,8 @@ name: Demo reset
 # One click on the Actions tab ("Run workflow") puts the demo back to its starting point:
 #  1. closes every open pull request (never merges) and deletes its branch
 #  2. rebuilds demo/inuvik-interleaver-fix as a one-line fix (interleaver 8 → 4) on top of main
-#  3. asks Flow to cancel old "CI failure: REQ-…" Linear tickets
+#  3. asks Flow to cancel old "CI failure: REQ-…" Linear tickets and take them out of the demo project
+#     (deleted instead, to Linear's 30-day trash, if a LINEAR_API_KEY secret is set)
 #  4. re-runs main CI, so Flow records REQ-44098 as Fail again and opens ONE fresh Linear ticket
 on:
   workflow_dispatch:
@@ -86,7 +87,9 @@ jobs:
         env:
           FLOW_API_KEY: ${{ secrets.FLOW_API_KEY }}
           FLOW_CUSTOMER: demo   # not a secret: as a secret, GitHub would mask the word "demo" in every link
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
+          python scripts/demo_reset.py purge
           python scripts/demo_reset.py verify
           next=$(( $(gh api "repos/$REPO/issues?state=all&per_page=1" -q '.[0].number') + 1 ))
           echo "- Next pull request will be **#$next**. Ready to demo." >> "$GITHUB_STEP_SUMMARY"

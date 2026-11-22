@@ -2,6 +2,7 @@
 
   python scripts/demo_reset.py cancel-tickets   # Flow cancels open 'CI failure: REQ-…' Linear tickets
   python scripts/demo_reset.py verify            # read REQ-44098 back from Flow on the starting branch
+  python scripts/demo_reset.py purge             # optional: with LINEAR_API_KEY, delete (trash) old tickets
 
 Needs FLOW_API_KEY / FLOW_CUSTOMER. Never prints secrets.
 """
@@ -26,11 +27,49 @@ def summary(text: str) -> None:
 def cancel_tickets() -> int:
     res = p.trigger("ci-linear-sync", {"reset": True})
     out = (res[0].get("integration_response") or "") if res else ""
-    canceled = []
+    result: dict = {}
     for line in out.splitlines():
         if line.startswith("RESULT="):
-            canceled = ast.literal_eval(line[len("RESULT="):]).get("canceled", [])
-    summary(f"- Linear: canceled {len(canceled)} old CI failure ticket(s): {', '.join(canceled) or 'none open'}")
+            result = ast.literal_eval(line[len("RESULT="):])
+    canceled, unlinked = result.get("canceled", []), result.get("removed_from_project", [])
+    summary(f"- Linear: canceled {len(canceled)} old CI failure ticket(s) ({', '.join(canceled) or 'none open'}); "
+            f"removed {len(unlinked)} from the demo project ({', '.join(unlinked) or 'none'})")
+    return 0
+
+
+def purge() -> int:
+    """Delete old 'CI failure: REQ-' tickets (FLO-13+) except the newest open one. Needs LINEAR_API_KEY.
+
+    Linear's issueDelete moves a ticket to the trash, where it can be restored for 30 days.
+    """
+    key = os.environ.get("LINEAR_API_KEY")
+    if not key:
+        summary("- Old tickets are canceled and out of the demo project. Add a LINEAR_API_KEY repo secret to delete them.")
+        return 0
+    import json
+    import urllib.request
+
+    def gql(query: str, variables: dict) -> dict:
+        req = urllib.request.Request("https://api.linear.app/graphql", method="POST",
+                                     data=json.dumps({"query": query, "variables": variables}).encode(),
+                                     headers={"Authorization": key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - fixed https endpoint
+            return json.loads(resp.read())
+
+    nodes = gql("""query { issues(first: 100, filter: { team: { key: { eq: "FLO" } }, number: { gt: 12 },
+                  title: { contains: "CI failure: REQ-" } }) { nodes { id identifier number state { type } } } }""",
+                {}).get("data", {}).get("issues", {}).get("nodes", [])
+    open_ = [n for n in nodes if n["state"]["type"] not in ("canceled", "completed")]
+    keep = max(open_, key=lambda n: n["number"])["identifier"] if open_ else None
+    deleted = []
+    mutation = "mutation($id: String!) { issueDelete(id: $id) { success } }"
+    for n in nodes:
+        if n["identifier"] == keep or n["number"] <= 12:
+            continue
+        if gql(mutation, {"id": n["id"]}).get("data", {}).get("issueDelete", {}).get("success"):
+            deleted.append(n["identifier"])
+    summary(f"- Linear: kept {keep}; moved {len(deleted)} old ticket(s) to the trash (restorable 30 days): "
+            f"{', '.join(deleted) or 'none'}")
     return 0
 
 
@@ -45,4 +84,4 @@ def verify() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit({"cancel-tickets": cancel_tickets, "verify": verify}[sys.argv[1]]())
+    sys.exit({"cancel-tickets": cancel_tickets, "verify": verify, "purge": purge}[sys.argv[1]]())
