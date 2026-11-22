@@ -18,6 +18,7 @@ What happens on every GitHub Actions run:
 Env: FLOW_API_KEY (secret), FLOW_CUSTOMER (e.g. "demo"), optional FLOW_API_BASE,
 PR_NUMBER / PR_TITLE / PR_URL (set by the workflow on pull_request events),
 optional LINEAR_API_KEY (lets CI also move fixed tickets to Done, comment and set the project),
+GITHUB_TOKEN (pull requests: one sticky "Flow requirements check" comment, updated on re-runs),
 and the GITHUB_* variables provided by GitHub Actions.
 """
 from __future__ import annotations
@@ -270,6 +271,130 @@ def write_pr_branch(branch_id: str, payload: dict, tickets: dict) -> int:
     return len(created)
 
 
+# ----------------------------------------------------------------------------- PR comment
+COMMENT_MARKER = "<!-- flow-requirements-check -->"
+STATUS_ICON = {"Pass": "✅ Pass", "Fail": "❌ Fail", "Inconclusive": "⚪ Inconclusive"}
+
+
+def affected_requirements(payload: dict) -> list:
+    refs: list = []
+    for t in payload["test_cases"]:
+        refs += [r for r in t.get("requirements", []) if r in IDS["requirements"]]
+    refs += [r["ref"] for r in payload["requirement_values"]]
+    return list(dict.fromkeys(refs))
+
+
+def tests_per_requirement(payload: dict) -> dict:
+    counts: dict = defaultdict(int)
+    for t in payload["test_cases"]:
+        for r in t.get("requirements", []):
+            counts[r] += t["passed"] + t["failed"] or 1
+    return counts
+
+
+def fmt(v) -> str:
+    return f"{v:g}" if isinstance(v, (int, float)) else str(v)
+
+
+def requirement_rows(payload: dict, branch_id: str) -> list:
+    """Read each affected requirement back from Flow on the branch (Verification is Flow's own formula)."""
+    import time
+    written = {r["ref"]: r["value"] for r in payload["requirement_values"]}
+    refs = affected_requirements(payload)
+    rows = []
+    for attempt in range(6):
+        time.sleep(3)
+        rows = []
+        for ref in refs:
+            v = get_entity(IDS["requirements"][ref]["id"], branch_id)["values"]
+            rows.append({"ref": ref, "name": v.get("name"), "status": v.get("verification") or "Inconclusive",
+                         "actual": num(v.get(ACTUAL)), "upper": num(v.get(UPPER)), "lower": num(v.get(LOWER)),
+                         "unit": v.get("unit") or ""})
+        if all(r["actual"] == written[r["ref"]] for r in rows if r["ref"] in written):
+            break
+    return rows
+
+
+def build_comment(payload: dict, rows: list | None, branch_name: str, branch_url: str, tickets: dict,
+                  error: str | None) -> str:
+    pr = payload["pr"]
+    sha = str(payload["commit"])[:7]
+    out = [COMMENT_MARKER, "## Flow requirements check", ""]
+    if error or rows is None:
+        failed_tcs = [t["ref"] for t in payload["test_cases"] if t["outcome"] == "fail"]
+        out += ["⚠️ **Flow did not record this run**, so requirement status was **not** verified in Flow.",
+                f"Error: `{error}`", "",
+                (f"Local test outcome only (not from Flow): {len(failed_tcs)} of {len(payload['test_cases'])} "
+                f"Flow test cases failed{': ' + ', '.join(failed_tcs) if failed_tcs else ''}."),
+                "", f"Re-run this check once Flow is reachable. [GitHub run]({payload['run_url']})"]
+        return "\n".join(out)
+    counts = tests_per_requirement(payload)
+    failing = [r for r in rows if r["status"] == "Fail"]
+    pending = [r for r in rows if r["status"] not in ("Pass", "Fail")]
+    if failing:
+        verdict = f"❌ **{len(failing)} requirement{'s' if len(failing) != 1 else ''} failing** of {len(rows)} linked to this PR"
+    elif pending:
+        verdict = (f"✅ **No requirement failing** – {len(rows) - len(pending)} pass, {len(pending)} still need "
+                   "other evidence (e.g. hardware tests)")
+    else:
+        verdict = f"✅ **All {len(rows)} linked requirements pass**"
+    out += [verdict, "",
+            "| Flow ID | Requirement | Status | Measured vs limit | Tests |",
+            "| -- | -- | -- | -- | --: |"]
+    order = {"Fail": 0, "Inconclusive": 1, "Pass": 2}
+    for r in sorted(rows, key=lambda r: (order.get(r["status"], 1), r["ref"])):
+        unit = f" {r['unit']}" if r["unit"] and r["unit"] not in ("count",) else ""
+        if r["actual"] is not None and r["upper"] is not None:
+            mv = f"{fmt(r['actual'])}{unit} vs ≤ {fmt(r['upper'])}{unit}"
+        elif r["actual"] is not None and r["lower"] is not None:
+            mv = f"{fmt(r['actual'])}{unit} vs ≥ {fmt(r['lower'])}{unit}"
+        elif r["actual"] is not None:
+            mv = f"{fmt(r['actual'])}{unit}"
+        else:
+            mv = "–"
+        out.append(f"| {r['ref']} | {r['name']} | {STATUS_ICON.get(r['status'], r['status'])} | {mv} | {counts.get(r['ref'], '–')} |")
+    out += ["", f"**Flow branch:** [{branch_name}]({branch_url}) – open the **Review** tab to see every item this PR changed.",
+            f"Project: {APP_URL}/"]
+    if tickets:
+        out += ["**Linear (stands in for Jira):** " + ", ".join(
+            f"[{v['identifier']}]({v['url']}) {v['action']}" for v in tickets.values())]
+    out += ["", (f"<sub>Status is read back from Flow's own Verification on this branch · commit `{sha}` · "
+                f"[GitHub run]({payload['run_url']}) · PR #{pr['number']}</sub>")]
+    return "\n".join(out)
+
+
+def upsert_pr_comment(pr_number: int, body: str) -> str:
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        print("No GITHUB_TOKEN/GITHUB_REPOSITORY: PR comment skipped")
+        return "skipped"
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+
+    def gh(method, path, data=None):
+        request = urllib.request.Request(api + path, method=method,
+                                         data=json.dumps(data).encode() if data is not None else None,
+                                         headers={"Authorization": f"Bearer {token}",
+                                                  "Accept": "application/vnd.github+json",
+                                                  "X-GitHub-Api-Version": "2022-11-28"})
+        with urllib.request.urlopen(request, timeout=30) as resp:  # nosec B310 - fixed https endpoint
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+
+    page = 1
+    while True:
+        comments = gh("GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}")
+        for c in comments:
+            if COMMENT_MARKER in (c.get("body") or ""):
+                gh("PATCH", f"/repos/{repo}/issues/comments/{c['id']}", {"body": body})
+                return f"updated {c.get('html_url')}"
+        if len(comments) < 100:
+            break
+        page += 1
+    c = gh("POST", f"/repos/{repo}/issues/{pr_number}/comments", {"body": body})
+    return f"created {c.get('html_url')}"
+
+
 def summary(lines: list) -> None:
     text = "\n".join(lines)
     print(text)
@@ -293,36 +418,52 @@ def main() -> int:
         print(json.dumps(payload, indent=2))
         return 0
     pr = payload["pr"]
+    branch_name, branch_id, tickets, how, error = MAIN_REVIEW_BRANCH, "master", {}, "", None
+    try:
+        if pr:
+            branch_id, branch_name = ensure_pr_branch(pr)
+            label = f"PR #{pr['number']}"
+        else:
+            branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
+            label = str(payload["branch"])
+        tickets = {} if args.no_linear else linear_sync(payload, label, branch_id)
+        linear_extras(tickets, label, payload)
+        if pr:
+            n = write_pr_branch(branch_id, payload, tickets)
+            how = f"wrote {n} test results + {len(payload['requirement_values'])} requirement values directly"
+        else:
+            for t in payload["test_cases"]:
+                if t["ref"] in tickets:
+                    t["linear_issue"] = tickets[t["ref"]]["url"]
+            res = trigger("ci-test-results", payload)
+            out = (res[0].get("integration_response") or "") if res else ""
+            how = "; ".join(ln.strip() for ln in out.splitlines() if ln.startswith(("Test results created", "Requirement values")))
+            how = how or "Flow automation 'Ingest CI test results' did not report results"
+            branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
+    except Exception as exc:  # noqa: BLE001 - report the failure instead of claiming a pass
+        error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        how = f"FAILED to record results in Flow ({error})"
+    branch_url = f"{APP_URL}/{branch_id}/table"
     if pr:
-        branch_id, branch_name = ensure_pr_branch(pr)
-        label = f"PR #{pr['number']}"
-    else:
-        branch_name = MAIN_REVIEW_BRANCH
-        branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
-        label = str(payload["branch"])
-    tickets = {} if args.no_linear else linear_sync(payload, label, branch_id)
-    linear_extras(tickets, label, payload)
-    if pr:
-        n = write_pr_branch(branch_id, payload, tickets)
-        how = f"wrote {n} test results + {len(payload['requirement_values'])} requirement values directly"
-    else:
-        for t in payload["test_cases"]:
-            if t["ref"] in tickets:
-                t["linear_issue"] = tickets[t["ref"]]["url"]
-        res = trigger("ci-test-results", payload)
-        out = (res[0].get("integration_response") or "") if res else ""
-        how = "; ".join(ln.strip() for ln in out.splitlines() if ln.startswith(("Test results created", "Requirement values")))
-        how = how or "Flow automation 'Ingest CI test results' did not report results"
-        branch_id = branch_id_by_name(MAIN_REVIEW_BRANCH)
-    lines = ["## Flow", f"- Flow branch: **{branch_name}** – {APP_URL}/{branch_id}/table", f"- {how}", "", "## Test cases"]
+        rows = None
+        if not error:
+            try:
+                rows = requirement_rows(payload, branch_id)
+            except Exception as exc:  # noqa: BLE001
+                error = f"could not read requirement status back from Flow: {type(exc).__name__}"
+        try:
+            print("PR comment:", upsert_pr_comment(pr["number"], build_comment(payload, rows, branch_name, branch_url,
+                                                                               tickets, error)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"PR comment failed: {type(exc).__name__}: {str(exc)[:200]}")
+    lines = ["## Flow", f"- Flow branch: **{branch_name}** – {branch_url}", f"- {how}", "", "## Test cases"]
     lines += [f"- {'✅' if t['outcome'] == 'pass' else '❌'} {t['ref']} {t['outcome'].upper()}"
               + (f" (measured {t['measured']})" if t["measured"] is not None else "") for t in payload["test_cases"]]
     if tickets:
         lines += ["", "## Linear (stands in for Jira)"]
         lines += [f"- {k}: {v['identifier']} {v['action']} – {v['url']}" for k, v in tickets.items()]
     summary(lines)
-    return 0
-
+    return 1 if error else 0
 
 if __name__ == "__main__":
     sys.exit(main())

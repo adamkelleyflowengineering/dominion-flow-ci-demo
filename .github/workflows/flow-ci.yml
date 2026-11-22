@@ -9,6 +9,10 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # sticky "Flow requirements check" comment on PRs
+      issues: write
     steps:
       - name: Record start time
         run: echo "WORKFLOW_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
@@ -41,6 +45,7 @@ jobs:
           FLOW_API_KEY: ${{ secrets.FLOW_API_KEY }}
           FLOW_CUSTOMER: ${{ secrets.FLOW_CUSTOMER }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pull requests get their own Flow branch: "GitHub PR #<n> – <title>"
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}

@@ -51,7 +51,11 @@ def test_planned_configuration_within_budget(config, flow_measure): ...
      the PR changed, and requirement Verification flips red/green on that branch.
    * **Push to `main` →** the Flow automation **Ingest CI test results** (`source: "ci-test-results"`)
      records the results on its review branch *Automation: Ingest CI test results*.
-3. The job summary on GitHub lists the Flow branch, every test case result and the Linear tickets.
+3. On pull requests, Flow's verdict is posted back as **one sticky PR comment** ("Flow requirements check",
+   by `github-actions[bot]`, updated in place on re-runs): overall verdict, a table of the affected requirements
+   with the status Flow computed on the PR branch, measured vs limit and number of tests, plus links to the Flow
+   branch and any Linear ticket. If Flow could not be reached, the comment says so instead of claiming a pass.
+4. The job summary on GitHub lists the Flow branch, every test case result and the Linear tickets.
 
 The intentionally failing case on `main` — *Inuvik relay corridor 300 km / interleaver 8* (≈ 147 ms RF,
 ≈ 261 ms end to end) — makes TES-44190 **Fail**, pushes REQ-44098's actual value over its 250 ms limit and
