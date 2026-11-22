@@ -62,7 +62,7 @@ jobs:
       - name: Cancel old CI failure tickets in Linear (via Flow)
         env:
           FLOW_API_KEY: ${{ secrets.FLOW_API_KEY }}
-          FLOW_CUSTOMER: ${{ secrets.FLOW_CUSTOMER }}
+          FLOW_CUSTOMER: demo   # not a secret: as a secret, GitHub would mask the word "demo" in every link
         run: python scripts/demo_reset.py cancel-tickets
 
       - name: Re-run main CI (expected to fail on REQ-44098)
@@ -85,7 +85,7 @@ jobs:
       - name: Check Flow shows REQ-44098 failing
         env:
           FLOW_API_KEY: ${{ secrets.FLOW_API_KEY }}
-          FLOW_CUSTOMER: ${{ secrets.FLOW_CUSTOMER }}
+          FLOW_CUSTOMER: demo   # not a secret: as a secret, GitHub would mask the word "demo" in every link
         run: |
           python scripts/demo_reset.py verify
           next=$(( $(gh api "repos/$REPO/issues?state=all&per_page=1" -q '.[0].number') + 1 ))

@@ -43,7 +43,7 @@ jobs:
         if: always()
         env:
           FLOW_API_KEY: ${{ secrets.FLOW_API_KEY }}
-          FLOW_CUSTOMER: ${{ secrets.FLOW_CUSTOMER }}
+          FLOW_CUSTOMER: demo   # not a secret: as a secret, GitHub would mask the word "demo" in every link
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pull requests get their own Flow branch: "GitHub PR #<n> – <title>"
