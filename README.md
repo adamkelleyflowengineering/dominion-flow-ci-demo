@@ -94,3 +94,10 @@ Hardware / HIL tests use the other two Flow automations from the same project:
 linked Inconclusive Test Result in Flow) and **Populate test results from Linear** (daily 4 AM PT agent
 that reads Done tickets and sets Pass/Fail + measured values). Example tickets live in the Linear
 project *Dominion demo – test execution loop* (team Flow Demo, FLO-5 … FLO-12).
+
+## Resetting the demo (practice runs)
+
+Actions tab → **Demo reset** → **Run workflow** (about 2–3 minutes). It closes open pull requests without merging,
+rebuilds `demo/inuvik-interleaver-fix` as a one-line fix on main, has Flow cancel old `CI failure: REQ-…` Linear
+tickets, and re-runs main CI so REQ-44098 is red again in Flow with one fresh open Linear ticket. The job summary
+lists the new ticket and the next PR number.
